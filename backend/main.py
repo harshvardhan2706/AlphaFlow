@@ -1,12 +1,16 @@
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 from typing import Dict, List
 from data_loader import read_csv_to_dataframe
 from model.ohlcv_model import OHLCV
+from pydantic import BaseModel, Field
+from backend.strategy import indicators as ind
+from backend.strategy.executor import execute_strategy
+from backend.strategy.logic_builder import evaluate_logic
 import logging
 
 app = FastAPI(title="AlphaFlow API")
@@ -93,6 +97,64 @@ async def get_data() -> Dict[str, List[OHLCV]]:
     except Exception as e:
         logger.exception(f"Error returning data: {e}")
         raise HTTPException(status_code=500, detail="Failed to return data")
+
+class StrategyRequest(BaseModel):
+    indicators: list = Field(..., description="List of indicators to apply, e.g. [{name: 'ema', params: {period: 20, price_col: 'close', out_col: 'ema_20'}}]")
+    logic: dict = Field(..., description="Logic rules with 'entry', 'exit', and 'conditions' list")
+    execution: dict = Field(..., description="Execution params: order_type, stop_loss, take_profit, etc.")
+
+@app.post("/run-strategy")
+async def run_strategy(req: StrategyRequest = Body(...)):
+    global ohlcv_data
+    if ohlcv_data is None:
+        raise HTTPException(status_code=400, detail="No data loaded. Upload data first.")
+    df = ohlcv_data.copy()
+    # Apply indicators
+    for ind_cfg in req.indicators:
+        name = ind_cfg['name'].lower()
+        params = ind_cfg.get('params', {})
+        if name == 'ema':
+            df = ind.add_ema(df, **params)
+        elif name == 'rsi':
+            df = ind.add_rsi(df, **params)
+        elif name == 'macd':
+            df = ind.add_macd(df, **params)
+        # Add more indicators as needed
+    # Evaluate logic
+    conditions = req.logic['conditions']
+    entry_logic = req.logic['entry']
+    exit_logic = req.logic['exit']
+    entry_signal = evaluate_logic(df, conditions, entry_logic)
+    exit_signal = evaluate_logic(df, conditions, exit_logic)
+    # Execution params
+    order_type = req.execution.get('order_type', 'market')
+    stop_loss = req.execution.get('stop_loss')
+    take_profit = req.execution.get('take_profit')
+    # Run strategy
+    result = execute_strategy(
+        df,
+        entry_signal,
+        exit_signal,
+        order_type=order_type,
+        initial_balance=req.execution.get('initial_balance', 10000.0),
+        position_size=req.execution.get('position_size', 1.0)
+    )
+    # Calculate Sharpe ratio
+    returns = pd.Series(result['trades']).apply(lambda t: t.get('pnl', 0))
+    if len(returns) > 1 and returns.std() != 0:
+        sharpe = (returns.mean() / returns.std()) * (252 ** 0.5)
+    else:
+        sharpe = 0.0
+    return {
+        'trades': result['trades'],
+        'metrics': {
+            'total_pnl': result['total_pnl'],
+            'max_drawdown': result['max_drawdown'],
+            'final_balance': result['final_balance'],
+            'total_trades': result['total_trades'],
+            'sharpe_ratio': sharpe
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
